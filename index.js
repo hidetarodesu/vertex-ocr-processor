@@ -4,10 +4,8 @@
 
 // 処理対象の入力バケット名 (GCS)
 const INPUT_BUCKET_NAME = 'receipt-input-data-2025-1005';
-// CSV出力先のバケット名（入力バケットと同じにして、ファイル名を output.csv とします）
+// CSV出力先のバケット名
 const OUTPUT_CSV_FILE = 'output.csv';
-
-// サービス アカウントに権限 (Storage, Vertex AI User) が必要です。
 
 // ===========================================
 // 依存関係のインポート
@@ -16,12 +14,9 @@ const { Storage } = require('@google/cloud-storage');
 const { VertexAI } = require('@google/cloud-vertexai');
 const { stringify } = require('csv-stringify');
 
-const storage = new Storage();
-
-// Vertex AI クライアントの初期化
-// リージョンは Cloud Run と同じ 'us-central1' を推奨
-const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'});
-const model = 'gemini-2.5-flash'; 
+// ★★★ 外部での初期化を削除します ★★★
+// const storage = new Storage();
+// const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'}); 
 
 // ===========================================
 // メイン関数 (GCSイベントを処理)
@@ -33,7 +28,11 @@ const model = 'gemini-2.5-flash';
  * @param {object} context The Cloud Functions context.
  */
 exports.processReceipt = async (event, context) => {
-    // 最終切り分けのために追加したログ
+    // ★★★ クライアントの初期化を関数の内側に移動します ★★★
+    const storage = new Storage();
+    const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'}); 
+    const model = 'gemini-2.5-flash'; 
+
     console.log("FUNCTION START: Received event and beginning execution.");
 
     // GCSイベントデータからファイル名とバケット名を取得
@@ -56,19 +55,19 @@ exports.processReceipt = async (event, context) => {
         console.log(`Processing receipt: ${fileName} from bucket: ${bucketName}`);
         
         // 1. ファイルをストリームで読み取り、base64 エンコード
-        const base64Image = await encodeFileToBase64(bucketName, fileName);
+        const base64Image = await encodeFileToBase64(bucketName, fileName, storage); // storageを渡す
 
         // 2. Gemini API で OCR 処理を実行
-        const jsonOutput = await analyzeImageWithGemini(base64Image);
+        const jsonOutput = await analyzeImageWithGemini(base64Image, vertex_ai, model); // vertex_aiとmodelを渡す
         
         // 3. データを CSV に変換
         const csvData = convertJsonToCsvData(jsonOutput, fileName);
 
         // 4. CSV ファイルに追記
-        await appendDataToCsvFile(csvData, OUTPUT_CSV_FILE);
+        await appendDataToCsvFile(csvData, OUTPUT_CSV_FILE, storage); // storageを渡す
         
         // 5. 処理済みとしてファイル名を変更
-        await renameFile(bucketName, fileName);
+        await renameFile(bucketName, fileName, storage); // storageを渡す
 
         console.log(`OCR processing complete for ${fileName}. Data appended to ${OUTPUT_CSV_FILE}.`);
 
@@ -76,7 +75,7 @@ exports.processReceipt = async (event, context) => {
         console.error(`Error processing file ${fileName}:`, error);
         // エラーが発生しても、ファイル名を変更して無限ループを防ぐ
         try {
-             await renameFile(bucketName, fileName, true);
+             await renameFile(bucketName, fileName, storage, true); // storageを渡す
         } catch (renameError) {
              console.error(`FATAL: Could not rename file after error: ${fileName}`, renameError);
         }
@@ -85,16 +84,13 @@ exports.processReceipt = async (event, context) => {
 };
 
 // ===========================================
-// ヘルパー関数
+// ヘルパー関数 (storage, vertex_aiを引数として受け取るように修正)
 // ===========================================
 
 /**
  * GCSファイルの内容を読み取り、Base64文字列にエンコードします。
- * @param {string} bucketName GCSバケット名
- * @param {string} fileName ファイル名
- * @returns {Promise<string>} Base64エンコードされたファイル文字列
  */
-async function encodeFileToBase64(bucketName, fileName) {
+async function encodeFileToBase64(bucketName, fileName, storage) {
     console.log(`Downloading file: ${fileName}`);
     const file = storage.bucket(bucketName).file(fileName);
     const [contents] = await file.download();
@@ -103,12 +99,11 @@ async function encodeFileToBase64(bucketName, fileName) {
 
 /**
  * Gemini APIを使用して画像の内容を分析し、指定されたJSON形式で出力を求めます。
- * @param {string} base64Image Base64エンコードされた画像文字列
- * @returns {Promise<object>} Geminiから返されたJSONオブジェクト
  */
-async function analyzeImageWithGemini(base64Image) {
+async function analyzeImageWithGemini(base64Image, vertex_ai, model) {
     console.log('Calling Gemini API for analysis...');
     
+    // ... (プロンプトとリクエストは省略せずに元のコードをそのまま使ってください)
     const prompt = `
         You are an expert receipt and invoice data extractor. 
         Analyze the image and extract the following information into a single JSON object.
@@ -137,38 +132,19 @@ async function analyzeImageWithGemini(base64Image) {
 
     const response = await vertex_ai.generateContent(request);
     
-    // Geminiの応答は文字列として返されるため、JSONとしてパース
     const textResponse = response.candidates[0].content.parts[0].text.trim();
     return JSON.parse(textResponse);
 }
 
 /**
- * Geminiから返されたJSONデータとファイル名をCSV形式の配列に変換します。
- * @param {object} jsonOutput GeminiのJSON出力
- * @param {string} sourceFileName 元のファイル名
- * @returns {Array<string[]>} CSVに書き込むための配列データ
- */
-function convertJsonToCsvData(jsonOutput, sourceFileName) {
-    // CSVのヘッダーは、初回書き込み時にのみ使用します。
-    // jsonOutputはキーと値のみを抽出し、元のファイル名を先頭に追加
-    const data = [
-        sourceFileName,
-        jsonOutput.store_name,
-        jsonOutput.total_amount,
-        jsonOutput.transaction_date
-    ];
-    return [data];
-}
-
-/**
  * GCS上のCSVファイルにデータを追記します。
- * @param {Array<string[]>} data CSVに書き込むデータ
- * @param {string} csvFileName CSVファイル名
  */
-async function appendDataToCsvFile(data, csvFileName) {
+async function appendDataToCsvFile(data, csvFileName, storage) {
     const bucket = storage.bucket(INPUT_BUCKET_NAME);
     const file = bucket.file(csvFileName);
     
+    // ... (CSV書き込みロジックは省略せずに元のコードをそのまま使ってください)
+
     let isNewFile = false;
     try {
         await file.getMetadata();
@@ -211,11 +187,8 @@ async function appendDataToCsvFile(data, csvFileName) {
 
 /**
  * 処理済みのファイル名を変更します。
- * @param {string} bucketName GCSバケット名
- * @param {string} fileName ファイル名
- * @param {boolean} isError 処理がエラーで完了したかどうか
  */
-async function renameFile(bucketName, fileName, isError = false) {
+async function renameFile(bucketName, fileName, storage, isError = false) {
     const bucket = storage.bucket(bucketName);
     const file = bucket.file(fileName);
     
@@ -224,4 +197,15 @@ async function renameFile(bucketName, fileName, isError = false) {
 
     await file.rename(newFileName);
     console.log(`Renamed ${fileName} to ${newFileName}`);
+}
+
+// ... (convertJsonToCsvData 関数は変更不要ですが、前の回答のコードには含まれていました)
+function convertJsonToCsvData(jsonOutput, sourceFileName) {
+    const data = [
+        sourceFileName,
+        jsonOutput.store_name,
+        jsonOutput.total_amount,
+        jsonOutput.transaction_date
+    ];
+    return [data];
 }
