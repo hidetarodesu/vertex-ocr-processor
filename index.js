@@ -26,43 +26,41 @@ const { stringify } = require('csv-stringify');
  */
 exports.processReceipt = async (event, context) => {
     
-    // ★★★ 最終デバッグログ 1: 関数開始を記録 ★★★
-    console.log("FUNCTION START: Received event and beginning execution.");
-
-    // クライアントの初期化を関数の内側に移動（クラッシュ対策）
-    const storage = new Storage();
-    const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'}); 
-    const model = 'gemini-2.5-flash'; 
-
-    // ★★★ 最終デバッグログ 2: クライアント初期化完了を記録 ★★★
-    console.log("CLIENTS INITIALIZED. Starting file processing.");
-
-    // GCSイベントデータからファイル名とバケット名を取得
-    const file = event.data;
-    const fileName = file.name;
-    const bucketName = file.bucket;
-
-    if (!fileName || !bucketName) {
-        console.error('Invalid GCS event data: Missing file name or bucket name.');
-        return;
-    }
-    
-    // 処理済みファイルを除外
-    if (fileName.startsWith('[PROCESSED]') || fileName === OUTPUT_CSV_FILE) {
-        console.log(`Skipping processed file or CSV file: ${fileName}`);
-        return;
-    }
-
+    // ★★★ 関数の全体を try...catch で囲み、エラーを強制的に捕捉します ★★★
     try {
+        // クライアントの初期化を関数の内側に移動（クラッシュ対策済み）
+        const storage = new Storage();
+        const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'}); 
+        const model = 'gemini-2.5-flash'; 
+
+        // 最初のログは標準エラーに出力（確実にログに出すため）
+        console.error("FUNCTION START: Received event and beginning execution.");
+
+        console.log("CLIENTS INITIALIZED. Starting file processing.");
+
+        // GCSイベントデータからファイル名とバケット名を取得
+        const file = event.data;
+        const fileName = file.name;
+        const bucketName = file.bucket;
+
+        if (!fileName || !bucketName) {
+            console.error('Invalid GCS event data: Missing file name or bucket name.');
+            return;
+        }
+        
+        // 処理済みファイルを除外
+        if (fileName.startsWith('[PROCESSED]') || fileName === OUTPUT_CSV_FILE) {
+            console.log(`Skipping processed file or CSV file: ${fileName}`);
+            return;
+        }
+
         console.log(`Processing receipt: ${fileName} from bucket: ${bucketName}`);
         
         // 1. ファイルをストリームで読み取り、base64 エンコード
-        // ★★★ 最終デバッグログ 3: GCSダウンロード前を記録 ★★★
         console.log("DEBUG STEP 3: Starting GCS download.");
         const base64Image = await encodeFileToBase64(bucketName, fileName, storage);
 
         // 2. Gemini API で OCR 処理を実行
-        // ★★★ 最終デバッグログ 4: Gemini呼び出し前を記録 ★★★
         console.log("DEBUG STEP 4: Starting Gemini API call.");
         const jsonOutput = await analyzeImageWithGemini(base64Image, vertex_ai, model);
         
@@ -70,7 +68,6 @@ exports.processReceipt = async (event, context) => {
         const csvData = convertJsonToCsvData(jsonOutput, fileName);
 
         // 4. CSV ファイルに追記
-        // ★★★ 最終デバッグログ 5: CSV書き込み前を記録 ★★★
         console.log("DEBUG STEP 5: Starting CSV append.");
         await appendDataToCsvFile(csvData, OUTPUT_CSV_FILE, storage);
         
@@ -80,14 +77,19 @@ exports.processReceipt = async (event, context) => {
         console.log(`OCR processing complete for ${fileName}. Data appended to ${OUTPUT_CSV_FILE}.`);
 
     } catch (error) {
-        console.error(`Error processing file ${fileName}:`, error);
-        // エラーが発生しても、ファイル名を変更して無限ループを防ぐ
+        // ★★★ トップレベルのエラーを捕捉し、重大度'ERROR'としてログに出力します ★★★
+        console.error("CRITICAL TOP-LEVEL CRASH:", error.message || error.toString());
+        
+        // エラーが発生しても、ファイル名を変更して無限ループを防ぐ（tryブロック内でエラーが発生した場合もファイル名変更を試みる）
+        const file = event.data;
         try {
-             await renameFile(bucketName, fileName, storage, true);
+             // エラー時にもstorageを再初期化してrenameを試みる
+             const storage = new Storage();
+             await renameFile(file.bucket, file.name, storage, true);
         } catch (renameError) {
-             console.error(`FATAL: Could not rename file after error: ${fileName}`, renameError);
+             console.error(`FATAL: Could not rename file after critical crash: ${file.name}`, renameError);
         }
-        throw new Error(`OCR Process Failed for ${fileName}`);
+        throw error; // Cloud Runがインスタンスを終了させるように再スロー
     }
 };
 
@@ -124,12 +126,12 @@ async function analyzeImageWithGemini(base64Image, vertex_ai, model) {
     const imagePart = {
         inlineData: {
             data: base64Image,
-            mimeType: 'image/png' // MIMEタイプを'image/png'に変更
+            mimeType: 'image/png' 
         },
     };
 
     const request = {
-        model: model, // モデル名を追加
+        model: model, 
         contents: [
             { role: 'user', parts: [imagePart, { text: prompt }] }
         ],
