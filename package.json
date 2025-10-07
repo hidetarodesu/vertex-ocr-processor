@@ -1,0 +1,15 @@
+{
+  "name": "receipt-ocr-processor",
+  "version": "1.0.0",
+  "description": "Cloud Run function for processing receipt OCR using Gemini API.",
+  "main": "index.js",
+  "scripts": {
+    "start": "functions-framework --target=processReceipt"
+  },
+  "dependencies": {
+    "@google/cloud-storage": "^7.0.0",
+    "@google/cloud-vertexai": "^0.1.0",
+    "csv-stringify": "^6.4.2",
+    "@google-cloud/functions-framework": "^3.4.0"
+  }
+}
