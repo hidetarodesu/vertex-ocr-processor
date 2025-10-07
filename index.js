@@ -30,7 +30,9 @@ exports.processReceipt = async (event, context) => {
     try {
         // クライアントの初期化を関数の内側に移動（クラッシュ対策済み）
         const storage = new Storage();
-        const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'}); 
+        
+        // ★★★ 修正点: VertexAIクライアントからlocation: 'us-central1'を削除 ★★★
+        const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT}); 
         const model = 'gemini-2.5-flash'; 
 
         // 最初のログは標準エラーに出力（確実にログに出すため）
@@ -94,7 +96,7 @@ exports.processReceipt = async (event, context) => {
 };
 
 // ===========================================
-// ヘルパー関数 (storage, vertex_aiを引数として受け取るように修正)
+// ヘルパー関数 (変更なし)
 // ===========================================
 
 /**
@@ -206,7 +208,7 @@ async function appendDataToCsvFile(data, csvFileName, storage) {
 }
 
 /**
- * 処理済みのファイル名変更します。
+ * 処理済みのファイル名を変更します。
  */
 async function renameFile(bucketName, fileName, storage, isError = false) {
     const bucket = storage.bucket(bucketName);
