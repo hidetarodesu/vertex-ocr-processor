@@ -26,13 +26,15 @@ const { stringify } = require('csv-stringify');
  */
 exports.processReceipt = async (event, context) => {
     
-    // ★★★ 関数の全体を try...catch で囲み、エラーを強制的に捕捉します ★★★
+    // ★★★ 最終修正: クライアント初期化を Promise.all で強制的に待機させる ★★★
     try {
-        // クライアントの初期化を関数の内側に移動（クラッシュ対策済み）
-        const storage = new Storage();
         
-        // ★★★ 修正点: VertexAIクライアントからlocation: 'us-central1'を削除 ★★★
-        const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT}); 
+        // GCSとVertexAIの初期化をPromiseでラップし、非同期で確実に待機する
+        const [storage, vertex_ai] = await Promise.all([
+            new Promise(resolve => resolve(new Storage())),
+            new Promise(resolve => resolve(new VertexAI({project: process.env.GCLOUD_PROJECT})))
+        ]);
+        
         const model = 'gemini-2.5-flash'; 
 
         // 最初のログは標準エラーに出力（確実にログに出すため）
@@ -82,7 +84,7 @@ exports.processReceipt = async (event, context) => {
         // ★★★ トップレベルのエラーを捕捉し、重大度'ERROR'としてログに出力します ★★★
         console.error("CRITICAL TOP-LEVEL CRASH:", error.message || error.toString());
         
-        // エラーが発生しても、ファイル名を変更して無限ループを防ぐ（tryブロック内でエラーが発生した場合もファイル名変更を試みる）
+        // エラーが発生しても、ファイル名を変更して無限ループを防ぐ
         const file = event.data;
         try {
              // エラー時にもstorageを再初期化してrenameを試みる
