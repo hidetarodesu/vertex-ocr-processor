@@ -206,7 +206,7 @@ async function appendDataToCsvFile(data, csvFileName, storage) {
 }
 
 /**
- * 処理済みのファイル名を変更します。
+ * 処理済みのファイル名変更します。
  */
 async function renameFile(bucketName, fileName, storage, isError = false) {
     const bucket = storage.bucket(bucketName);
