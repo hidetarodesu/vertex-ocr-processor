@@ -1,186 +1,227 @@
-// ====================================================================
-// GCP Cloud Functions x Google Gen AI - 請求書/領収書 OCR スクリプト
-// ====================================================================
+// ===========================================
+// 環境設定
+// ===========================================
 
-// 必要なライブラリのインポート (package.json に依存)
+// 処理対象の入力バケット名 (GCS)
+const INPUT_BUCKET_NAME = 'receipt-input-data-2025-1005';
+// CSV出力先のバケット名（入力バケットと同じにして、ファイル名を output.csv とします）
+const OUTPUT_CSV_FILE = 'output.csv';
+
+// サービス アカウントに権限 (Storage, Vertex AI User) が必要です。
+
+// ===========================================
+// 依存関係のインポート
+// ===========================================
 const { Storage } = require('@google/cloud-storage');
 const { VertexAI } = require('@google/cloud-vertexai');
-const stringify = require('csv-stringify').stringify;
+const { stringify } = require('csv-stringify');
 
-// 設定値
-// CSVファイルを出力するバケット名 (入力バケットと同じ)
-const BUCKET_NAME = 'receipt-input-data-2025-1005'; // ★プロジェクトに合わせて変更してください★
-const CSV_FILE_NAME = 'receipt_data.csv';
-const TARGET_MODEL = 'gemini-2.5-flash';
-
-// クライアントの初期化 (認証はサービスアカウントで自動)
 const storage = new Storage();
-const ai = new VertexAI({}); 
+
+// Vertex AI クライアントの初期化
+// リージョンは Cloud Run と同じ 'us-central1' を推奨
+const vertex_ai = new VertexAI({project: process.env.GCLOUD_PROJECT, location: 'us-central1'});
+const model = 'gemini-2.5-flash'; 
+
+// ===========================================
+// メイン関数 (GCSイベントを処理)
+// ===========================================
 
 /**
- * Cloud Storageへのファイルアップロードをトリガーとして実行されるメイン関数
- * @param {object} file - アップロードされたファイルの情報
+ * GCSにファイルがアップロードされたイベントを処理します。
+ * @param {object} event The Cloud Storage event payload.
+ * @param {object} context The Cloud Functions context.
  */
-exports.processReceipt = async (file) => {
-    const fileName = file.name;
-    const mimeType = file.contentType;
+exports.processReceipt = async (event, context) => {
+    // 最終切り分けのために追加したログ
+    console.log("FUNCTION START: Received event and beginning execution.");
 
-    // 既に処理済みのファイルまたはCSVファイル自体はスキップ
-    if (fileName.includes('[PROCESSED]') || fileName === CSV_FILE_NAME) {
-        console.log(`Skipping file: ${fileName}`);
+    // GCSイベントデータからファイル名とバケット名を取得
+    const file = event.data;
+    const fileName = file.name;
+    const bucketName = file.bucket;
+
+    if (!fileName || !bucketName) {
+        console.error('Invalid GCS event data: Missing file name or bucket name.');
+        return;
+    }
+    
+    // 処理済みファイルを除外
+    if (fileName.startsWith('[PROCESSED]') || fileName === OUTPUT_CSV_FILE) {
+        console.log(`Skipping processed file or CSV file: ${fileName}`);
         return;
     }
 
-    console.log(`Processing file: ${fileName} (${file.id})`);
-
     try {
-        // 1. ファイルをBase64にエンコード
-        const base64Data = await encodeFileToBase64(BUCKET_NAME, fileName);
-        if (!base64Data) return;
+        console.log(`Processing receipt: ${fileName} from bucket: ${bucketName}`);
+        
+        // 1. ファイルをストリームで読み取り、base64 エンコード
+        const base64Image = await encodeFileToBase64(bucketName, fileName);
 
-        // 2. Gemini API呼び出し
-        const extractedData = await callGeminiApi(base64Data, mimeType);
-        if (!extractedData) return;
+        // 2. Gemini API で OCR 処理を実行
+        const jsonOutput = await analyzeImageWithGemini(base64Image);
+        
+        // 3. データを CSV に変換
+        const csvData = convertJsonToCsvData(jsonOutput, fileName);
 
-        // 3. CSVファイルに追記
-        await appendDataToCsvFile(extractedData, fileName);
+        // 4. CSV ファイルに追記
+        await appendDataToCsvFile(csvData, OUTPUT_CSV_FILE);
+        
+        // 5. 処理済みとしてファイル名を変更
+        await renameFile(bucketName, fileName);
 
-        // 4. 処理後、ファイル名を変更して二重処理を防ぐ (リネーム)
-        await renameFile(BUCKET_NAME, fileName);
-
-        console.log(`Successfully processed and renamed ${fileName}`);
+        console.log(`OCR processing complete for ${fileName}. Data appended to ${OUTPUT_CSV_FILE}.`);
 
     } catch (error) {
-        console.error(`Error processing ${fileName}: ${error.message}`);
-        // 処理失敗時も、エラーの詳細をログに残す
+        console.error(`Error processing file ${fileName}:`, error);
+        // エラーが発生しても、ファイル名を変更して無限ループを防ぐ
+        try {
+             await renameFile(bucketName, fileName, true);
+        } catch (renameError) {
+             console.error(`FATAL: Could not rename file after error: ${fileName}`, renameError);
+        }
+        throw new Error(`OCR Process Failed for ${fileName}`);
     }
 };
 
-
-// ====================================================================
-// ヘルパー関数 (ロジック本体)
-// ====================================================================
+// ===========================================
+// ヘルパー関数
+// ===========================================
 
 /**
- * Cloud Storageからファイルを取得し、Base64形式にエンコードします。
+ * GCSファイルの内容を読み取り、Base64文字列にエンコードします。
+ * @param {string} bucketName GCSバケット名
+ * @param {string} fileName ファイル名
+ * @returns {Promise<string>} Base64エンコードされたファイル文字列
  */
 async function encodeFileToBase64(bucketName, fileName) {
-    try {
-        const file = storage.bucket(bucketName).file(fileName);
-        const [data] = await file.download();
-        
-        // Base64エンコード
-        return data.toString('base64');
-    } catch (e) {
-        console.error(`Error downloading or encoding file: ${e.message}`);
-        return null;
-    }
+    console.log(`Downloading file: ${fileName}`);
+    const file = storage.bucket(bucketName).file(fileName);
+    const [contents] = await file.download();
+    return contents.toString('base64');
 }
 
 /**
- * Gemini APIを呼び出し、画像から情報を抽出します。
+ * Gemini APIを使用して画像の内容を分析し、指定されたJSON形式で出力を求めます。
+ * @param {string} base64Image Base64エンコードされた画像文字列
+ * @returns {Promise<object>} Geminiから返されたJSONオブジェクト
  */
-async function callGeminiApi(base64Data, mimeType) {
+async function analyzeImageWithGemini(base64Image) {
+    console.log('Calling Gemini API for analysis...');
+    
     const prompt = `
-あなたは経理の専門家です。この領収書または請求書の画像から、以下の4項目を正確に抽出し、日本語でJSON形式で出力してください。
-- invoice_number (請求書番号または領収書番号): 番号がない場合は「N/A」
-- issuing_company (発行元企業名): 企業名がわからない場合は「N/A」
-- issue_date (発行日): YYYY-MM-DD形式に変換。日付がない場合は「N/A」
-- total_amount (合計金額): 数字のみを抽出し、小数点以下は切り捨て。金額が不明な場合は 0
+        You are an expert receipt and invoice data extractor. 
+        Analyze the image and extract the following information into a single JSON object.
+        1. store_name: The name of the store or merchant.
+        2. total_amount: The total amount paid (numeric value).
+        3. transaction_date: The date of the transaction in YYYY-MM-DD format.
 
-抽出結果は、指定されたJSONスキーマに従って出力してください。他のコメントや説明は一切含めないでください。
-`;
+        If any field is missing, use "N/A" for strings and 0 for numbers.
+    `;
+    
+    const imagePart = {
+        inlineData: {
+            data: base64Image,
+            mimeType: 'image/jpeg' // PNGやJPEGなど、実際のMIMEタイプに合わせて変更
+        },
+    };
 
-    try {
-        const response = await ai.models.generateContent({
-            model: TARGET_MODEL,
-            contents: [
-                { role: "user", parts: [
-                    { text: prompt },
-                    { inlineData: { mimeType: mimeType, data: base64Data } }
-                ]}
-            ],
-            config: {
-                // Geminiの応答形式をJSONに固定
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: "OBJECT",
-                    properties: {
-                        invoice_number: { type: "STRING" },
-                        issuing_company: { type: "STRING" },
-                        issue_date: { type: "STRING" },
-                        total_amount: { type: "NUMBER" }
-                    }
-                }
-            }
-        });
-        
-        // 応答テキストからJSON部分を抽出してパース
-        const jsonText = response.response.candidates[0].content.parts[0].text;
-        const extractedData = JSON.parse(jsonText.trim()); 
-        
-        return extractedData;
-    } catch (e) {
-        console.error("Gemini API呼び出しまたはJSONパースエラー: " + e.message);
-        return null;
-    }
+    const request = {
+        contents: [
+            { role: 'user', parts: [imagePart, { text: prompt }] }
+        ],
+        config: {
+            responseMimeType: "application/json",
+        },
+    };
+
+    const response = await vertex_ai.generateContent(request);
+    
+    // Geminiの応答は文字列として返されるため、JSONとしてパース
+    const textResponse = response.candidates[0].content.parts[0].text.trim();
+    return JSON.parse(textResponse);
 }
 
 /**
- * 抽出されたデータをCSVファイルに追記します。
+ * Geminiから返されたJSONデータとファイル名をCSV形式の配列に変換します。
+ * @param {object} jsonOutput GeminiのJSON出力
+ * @param {string} sourceFileName 元のファイル名
+ * @returns {Array<string[]>} CSVに書き込むための配列データ
  */
-async function appendDataToCsvFile(data, sourceFileName) {
-    const bucket = storage.bucket(BUCKET_NAME);
-    const csvFile = bucket.file(CSV_FILE_NAME);
-
-    // CSVヘッダーの定義
-    const columns = [
-        'source_file', 'invoice_number', 'issuing_company', 'issue_date', 'total_amount'
+function convertJsonToCsvData(jsonOutput, sourceFileName) {
+    // CSVのヘッダーは、初回書き込み時にのみ使用します。
+    // jsonOutputはキーと値のみを抽出し、元のファイル名を先頭に追加
+    const data = [
+        sourceFileName,
+        jsonOutput.store_name,
+        jsonOutput.total_amount,
+        jsonOutput.transaction_date
     ];
+    return [data];
+}
+
+/**
+ * GCS上のCSVファイルにデータを追記します。
+ * @param {Array<string[]>} data CSVに書き込むデータ
+ * @param {string} csvFileName CSVファイル名
+ */
+async function appendDataToCsvFile(data, csvFileName) {
+    const bucket = storage.bucket(INPUT_BUCKET_NAME);
+    const file = bucket.file(csvFileName);
     
-    // データ行の準備
-    const dataRow = [{
-        source_file: sourceFileName,
-        ...data
-    }];
+    let isNewFile = false;
+    try {
+        await file.getMetadata();
+    } catch (e) {
+        if (e.code === 404) {
+            isNewFile = true;
+        } else {
+            throw e;
+        }
+    }
+
+    const stringifier = stringify({ header: isNewFile, columns: ['SourceFile', 'StoreName', 'TotalAmount', 'TransactionDate'] });
+    let csvString = '';
     
-    // CSV文字列に変換
-    const csvData = await new Promise((resolve, reject) => {
-        stringify(dataRow, { header: false, columns: columns }, (err, output) => {
-            if (err) return reject(err);
-            resolve(output);
-        });
-    });
+    // 配列をCSV文字列に変換
+    for (const record of data) {
+        stringifier.write(record);
+    }
+    stringifier.end();
+
+    for await (const chunk of stringifier) {
+        csvString += chunk;
+    }
 
     try {
-        // CSVファイルの存在確認
-        const [exists] = await csvFile.exists();
-        
-        if (!exists) {
-            // ファイルが存在しない場合、ヘッダーを作成
-            const headerRow = columns.join(',') + '\n';
-            await csvFile.save(headerRow + csvData);
-            console.log(`Created new CSV file and added data for ${sourceFileName}.`);
-        } else {
-            // ファイルが存在する場合、追記
-            const appendedData = '\n' + csvData.trim();
-            await csvFile.append(appendedData);
-            console.log(`Appended data to existing CSV file for ${sourceFileName}.`);
-        }
+        // GCSファイルに追記 (append)
+        await file.createWriteStream({
+            metadata: { contentType: 'text/csv' },
+            resumable: false,
+            // 既存ファイルの場合は追記、新規の場合は最初から
+            offset: isNewFile ? 0 : (await file.getMetadata())[0].size,
+        }).end(csvString);
+
+        console.log(`Appended data to CSV file: ${csvFileName}.`);
     } catch (e) {
-        console.error(`Error writing to CSV file: ${e.message}`);
+        console.error('Error writing to CSV file:', e.message);
         throw new Error('CSV書き込みエラー');
     }
 }
 
 /**
  * 処理済みのファイル名を変更します。
+ * @param {string} bucketName GCSバケット名
+ * @param {string} fileName ファイル名
+ * @param {boolean} isError 処理がエラーで完了したかどうか
  */
-async function renameFile(bucketName, fileName) {
+async function renameFile(bucketName, fileName, isError = false) {
     const bucket = storage.bucket(bucketName);
     const file = bucket.file(fileName);
-    const newFileName = `[PROCESSED]${fileName}`;
     
+    const prefix = isError ? '[ERROR_PROCESSED]' : '[PROCESSED]';
+    const newFileName = `${prefix}${fileName}`;
+
     await file.rename(newFileName);
     console.log(`Renamed ${fileName} to ${newFileName}`);
 }
